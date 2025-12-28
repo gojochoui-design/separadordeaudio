@@ -1,3 +1,4 @@
+# (modificado) app.py - Audio separator with aggressive vocal cleaning
 import os
 import spaces
 import gc
@@ -727,31 +728,165 @@ def process_uvr_task(
     )
 
 
-def add_instrumental_effects(input_file, output_file,
-                             highpass_freq=120, lowpass_freq=11000,
-                             compressor_threshold_db=-15, compressor_ratio=1.4,
-                             compressor_attack_ms=15, compressor_release_ms=80,
-                             gain_db=0):
+# --- NUEVAS FUNCIONES: limpieza agresiva de voz (sin nuevas dependencias) ---
 
-    effects = [
-        HighpassFilter(cutoff_frequency_hz=highpass_freq),
-        LowpassFilter(cutoff_frequency_hz=lowpass_freq),
-        Compressor(threshold_db=compressor_threshold_db,
-                   ratio=compressor_ratio,
-                   attack_ms=compressor_attack_ms,
-                   release_ms=compressor_release_ms)
-    ]
+def _smooth_mask(mask: np.ndarray, freq_smooth: int = 3, time_smooth: int = 15) -> np.ndarray:
+    """
+    Smooth a 2D mask with simple separable box filters (freq x time).
+    Implementado con convoluciones 1D en numpy para evitar dependencias.
+    """
+    if freq_smooth <= 1 and time_smooth <= 1:
+        return mask
+    sm = mask.astype(np.float32)
+    # Smooth freq axis
+    if freq_smooth > 1:
+        kernel_f = np.ones((freq_smooth, 1), dtype=np.float32) / freq_smooth
+        # pad and convolve along axis 0
+        sm = np.apply_along_axis(lambda m: np.convolve(m, np.ones(freq_smooth)/freq_smooth, mode='same'), axis=0, arr=sm)
+    # Smooth time axis
+    if time_smooth > 1:
+        sm = np.apply_along_axis(lambda m: np.convolve(m, np.ones(time_smooth)/time_smooth, mode='same'), axis=1, arr=sm)
+    return sm
+
+
+def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
+                           n_fft: int = 2048, hop_length: int = 512,
+                           n_std_thresh: float = 1.5, prop_decrease: float = 1.0,
+                           freq_smooth: int = 3, time_smooth: int = 15):
+    """
+    Aggressive spectral noise reduction + mild spectral gating to remove reverb / background vocals.
+    - input_path/output_path: rutas de archivos
+    - n_fft/hop_length: STFT params (mayor n_fft => mejor resolución frecuencia)
+    - n_std_thresh: multiplicador para estimar nivel de ruido
+    - prop_decrease: cuánto restar del ruido estimado (1.0 = por completo)
+    - freq_smooth/time_smooth: suavizado de máscara
+    """
+    try:
+        data, file_sr = sf.read(input_path, always_2d=True)
+        if file_sr != sr:
+            # resample if needed
+            data = np.stack([librosa.resample(d.astype(np.float32), file_sr, sr) for d in data.T], axis=1)
+            data = data.T
+            file_sr = sr
+        # ensure shape channels x samples
+        if data.ndim == 2 and data.shape[1] >= 1:
+            channels = data.shape[1]
+            samples = data.shape[0]
+            # convert to shape (channels, samples)
+            data = data.T
+        else:
+            data = data.reshape((1, -1))
+        cleaned_ch = []
+        for ch in range(data.shape[0]):
+            y = data[ch].astype(np.float32)
+            # STFT
+            S_full = librosa.stft(y, n_fft=n_fft, hop_length=hop_length, window='hann')
+            mag, phase = np.abs(S_full), np.angle(S_full)
+            # frame energies
+            frame_energy = np.mean(mag, axis=0)
+            # pick quiet frames as noise estimate (10th percentile)
+            perc = max(1, int(np.percentile(frame_energy, 10) != 0))
+            thresh = np.percentile(frame_energy, 10)
+            noise_frames_idx = np.where(frame_energy <= thresh)[0]
+            if noise_frames_idx.size == 0:
+                # fallback: first few frames
+                noise_frames_idx = np.arange(min(10, mag.shape[1]))
+            # noise magnitude estimate (median across quiet frames)
+            noise_mag = np.median(mag[:, noise_frames_idx], axis=1, keepdims=True)
+            # spectral subtraction
+            mag_sub = mag - noise_mag * prop_decrease
+            mag_sub = np.maximum(mag_sub, 0.0)
+            # create soft mask based on SNR-like measure
+            eps = 1e-8
+            mask = (mag_sub / (mag + eps))
+            # sharpen mask with threshold multiplier
+            mask = np.where(mag > (noise_mag * n_std_thresh), mask, 0.0)
+            # smooth mask to avoid musical noise
+            mask = _smooth_mask(mask, freq_smooth=freq_smooth, time_smooth=time_smooth)
+            mask = np.clip(mask, 0.0, 1.0)
+            # apply mask (optionally power scale)
+            S_clean = mask * S_full
+            # ISTFT
+            y_clean = librosa.istft(S_clean, hop_length=hop_length, window='hann', length=len(y))
+            # final highpass to remove rumble (<80Hz)
+            # apply simple spectral check: remove tiny DC offsets
+            y_clean = y_clean - np.mean(y_clean)
+            cleaned_ch.append(y_clean)
+        # Align lengths
+        maxlen = max(map(len, cleaned_ch))
+        cleaned = np.stack([np.pad(c, (0, maxlen - len(c)), mode='constant') for c in cleaned_ch], axis=0)
+        # transpose to (samples, channels) for writing
+        out = cleaned.T
+        sf.write(output_path, out, file_sr)
+        return output_path
+    except Exception as e:
+        logger.error(f"Aggressive clean failed: {e}")
+        # fallback: copy original
+        try:
+            sf.write(output_path, sf.read(input_path)[0], sr)
+            return output_path
+        except Exception:
+            return input_path
+
+
+def add_vocal_effects(input_file, output_file, reverb_room_size=0.6, vocal_reverb_dryness=0.8, reverb_damping=0.6, reverb_wet_level=0.35,
+                      delay_seconds=0.4, delay_mix=0.25,
+                      compressor_threshold_db=-25, compressor_ratio=3.5, compressor_attack_ms=10, compressor_release_ms=60,
+                      gain_db=3, extreme_clean: bool = False):
+    """
+    Apply vocal effects. If extreme_clean=True:
+    - Force removal of reverb/delay (we don't add them).
+    - Run an aggressive spectral clean before effects.
+    """
+    # Prepare temporary cleaned file if extreme_clean
+    tmp_clean = input_file
+    if extreme_clean:
+        try:
+            base, ext = os.path.splitext(os.path.abspath(input_file))
+            tmp_clean = base + "_extremeclean" + ext
+            # more aggressive parameters for extreme cleaning
+            aggressive_vocal_clean(input_file, tmp_clean,
+                                   sr=44100, n_fft=4096, hop_length=512,
+                                   n_std_thresh=1.2, prop_decrease=1.2,
+                                   freq_smooth=5, time_smooth=25)
+            # When extreme_clean, disable reverb/delay completely
+            reverb_room_size = 0.0
+            reverb_wet_level = 0.0
+            delay_seconds = 0.0
+            delay_mix = 0.0
+        except Exception as e:
+            logger.error(f"extreme clean failed: {e}")
+            tmp_clean = input_file
+
+    effects = [HighpassFilter()]
+
+    if reverb_room_size > 0 or reverb_wet_level > 0:
+        effects.append(Reverb(room_size=reverb_room_size, damping=reverb_damping, wet_level=reverb_wet_level, dry_level=vocal_reverb_dryness))
+
+    effects.append(Compressor(threshold_db=compressor_threshold_db, ratio=compressor_ratio,
+                              attack_ms=compressor_attack_ms, release_ms=compressor_release_ms))
+
+    if delay_seconds > 0 and delay_mix > 0:
+        effects.append(Delay(delay_seconds=delay_seconds, mix=delay_mix))
+
+    if gain_db:
+        effects.append(Gain(gain_db=gain_db))
 
     board = Pedalboard(effects)
 
-    with AudioFile(input_file) as f:
+    with AudioFile(tmp_clean) as f:
         with AudioFile(output_file, 'w', f.samplerate, f.num_channels) as o:
+            # Read one second of audio at a time, until the file is empty:
             while f.tell() < f.frames:
                 chunk = f.read(int(f.samplerate))
                 effected = board(chunk, f.samplerate, reset=False)
                 o.write(effected)
-
-
+    # if temporary file was created, optionally remove it
+    if extreme_clean and tmp_clean != input_file and os.path.exists(tmp_clean):
+        try:
+            os.remove(tmp_clean)
+        except Exception:
+            pass
 
 
 def add_instrumental_effects(input_file, output_file, highpass_freq=100, lowpass_freq=12000,
@@ -854,7 +989,6 @@ def sound_separate(
     background_gain_db=3,
     target_format="WAV",
 ):
-    dereverb = True
     if not media_file:
         raise ValueError("The audio path is missing.")
 
@@ -889,11 +1023,13 @@ def sound_separate(
                 file_name, file_extension = os.path.splitext(os.path.abspath(vocal_audio))
                 out_effects = file_name + suffix + file_extension
                 out_effects_path = os.path.join(media_dir, out_effects)
+                # Llamamos a add_vocal_effects con extreme_clean=True para limpieza agresiva
                 add_vocal_effects(vocal_audio, out_effects_path,
                                   reverb_room_size=vocal_reverb_room_size, reverb_damping=vocal_reverb_damping, vocal_reverb_dryness=vocal_reverb_dryness, reverb_wet_level=vocal_reverb_wet_level,
                                   delay_seconds=vocal_delay_seconds, delay_mix=vocal_delay_mix,
                                   compressor_threshold_db=vocal_compressor_threshold_db, compressor_ratio=vocal_compressor_ratio, compressor_attack_ms=vocal_compressor_attack_ms, compressor_release_ms=vocal_compressor_release_ms,
-                                  gain_db=vocal_gain_db
+                                  gain_db=vocal_gain_db,
+                                  extreme_clean=True
                                   )
                 vocal_audio = out_effects_path
 
