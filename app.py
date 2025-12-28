@@ -1,7 +1,6 @@
-# app.py — Audio separator with improved aggressive cleaning, smart optional enhancement and fast/quality modes
-# NOTE: This version intentionally does NOT include any hardcoded external ONNX links.
-# If you want to use external models (DeepFilterNet, Demucs, etc.) place one URL per line in model_links.txt
-# or put model files directly into the mdx_models/ directory. The script will not invent links.
+# app.py — Audio separator with aggressive vocal cleaning, smart optional enhancement and fast/quality modes
+# This file is a consolidated, corrected and improved version of your app.
+# It avoids inventing ONNX links; if you want to use models place them in mdx_models/ or add URLs to model_links.txt.
 
 import os
 import gc
@@ -33,12 +32,10 @@ from pedalboard import Pedalboard, Reverb, Delay, Chorus, Compressor, Gain, High
 from pedalboard.io import AudioFile
 import argparse
 import logging
-
-# Optional network downloader (used only if user supplies model_links.txt)
 import requests
-from urllib.parse import urlparse, urljoin
 import re
 import shutil
+from urllib.parse import urlparse, urljoin
 
 parser = argparse.ArgumentParser(description="Run the app with optional sharing")
 parser.add_argument('--share', action='store_true', help='Enable sharing mode')
@@ -49,29 +46,25 @@ warnings.filterwarnings("ignore")
 IS_COLAB = True if ('google.colab' in sys.modules or args.share) else False
 IS_ZERO_GPU = os.getenv("SPACES_ZERO_GPU")
 
-# Basic UI text
 title = "<center><strong><font size='7'>Audio🔹separator</font></strong></center>"
 base_demo = "This demo uses the "
 description = (f"{base_demo if IS_ZERO_GPU else ''}MDX-Net / enhancement pipeline for vocal and background separation.")
-RESOURCES = "- For best results provide enhancement/separation models in mdx_models/ or list them in model_links.txt."
+RESOURCES = "- For best results place enhancement/separation ONNX models into mdx_models/ or list them in model_links.txt."
 
-# Model folders
+# Paths
 BASE_DIR = "."
 mdxnet_models_dir = os.path.join(BASE_DIR, "mdx_models")
 output_dir = os.path.join(BASE_DIR, "clean_song_output")
 os.makedirs(mdxnet_models_dir, exist_ok=True)
 os.makedirs(output_dir, exist_ok=True)
+os.makedirs("logs", exist_ok=True)
 
-# Reduce noisy logs, but keep important logging to file
-logging.basicConfig(filename=os.path.join("logs" if os.path.exists("logs") else ".", "app.log"),
-                    level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# logging
+logging.basicConfig(filename=os.path.join("logs", "app.log"), level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger.setLevel(logging.INFO)
 
-# --------------------------- Small helpers ---------------------------
-
+# Small helpers
 def show_components_downloader(value_active):
-    # Callback expected by UI: show/hide URL components
     return gr.update(visible=value_active), gr.update(visible=value_active)
 
 def safe_mkdir(path):
@@ -81,17 +74,13 @@ def safe_mkdir(path):
         pass
 
 def get_hash(filepath):
-    # Short blake2b for naming uniqueness
     h = hashlib.blake2b()
     with open(filepath, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()[:18]
 
-# ------------------- Simple smart downloader (user-provided links only) -------------------
-# This downloader will only try URLs listed in model_links.txt (if present).
-# It does NOT contain any hardcoded external links.
-
+# Simple user-driven downloader (only uses links you provide in model_links.txt)
 def _requests_download(url: str, dest: str, timeout: int = 60) -> bool:
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -102,21 +91,18 @@ def _requests_download(url: str, dest: str, timeout: int = 60) -> bool:
                     if chunk:
                         f.write(chunk)
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            logger.info(f"Downloaded {url} -> {dest}")
             return True
     except Exception as e:
         logger.warning(f"Requests download failed for {url}: {e}")
     return False
 
 def try_download_from_page(url: str, dest: str) -> bool:
-    """
-    If url is a page, try to fetch it and look for .onnx links and attempt to download the first one.
-    """
     try:
         r = requests.get(url, timeout=20)
         if r.status_code != 200:
             return False
         html = r.text
-        # find .onnx references
         m = re.search(r'href=["\']([^"\']+\.onnx[^"\']*)["\']', html, flags=re.IGNORECASE)
         if m:
             candidate = urljoin(url, m.group(1))
@@ -126,10 +112,6 @@ def try_download_from_page(url: str, dest: str) -> bool:
     return False
 
 def download_models_from_list():
-    """
-    Reads model_links.txt (if present) and attempts simple downloads.
-    Does not invent links. Use this to provide any models you want integrated.
-    """
     links_file = "model_links.txt"
     if not os.path.exists(links_file):
         return
@@ -140,37 +122,27 @@ def download_models_from_list():
             if not url or url.startswith("#"):
                 continue
             parsed = urlparse(url)
-            fname = os.path.basename(parsed.path) or hashlib.blake2b(url.encode()).hexdigest()[:12]
+            fname = os.path.basename(parsed.path) or hashlib.blake2b(url.encode()).hexdigest()[:12] + ".onnx"
             dest = os.path.join(mdxnet_models_dir, fname)
             if os.path.exists(dest) and os.path.getsize(dest) > 0:
                 logger.info(f"Skipping existing model {fname}")
                 continue
-            # If it seems direct file -> try direct
             if url.lower().endswith(".onnx"):
-                ok = _requests_download(url, dest)
-                if ok:
-                    logger.info(f"Downloaded {url} -> {dest}")
+                if _requests_download(url, dest):
                     continue
-            # try resolving known patterns
-            # try raw github transform
             if "github.com" in parsed.netloc and "/blob/" in parsed.path:
                 parts = parsed.path.split("/")
                 if len(parts) > 4:
                     owner = parts[1]; repo = parts[2]; branch = parts[4]
                     rest = "/".join(parts[5:])
                     raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}"
-                    if raw.lower().endswith(".onnx"):
-                        if _requests_download(raw, dest):
-                            logger.info(f"Downloaded {raw} -> {dest}")
-                            continue
-            # fallback: check the page for any .onnx link
+                    if raw.lower().endswith(".onnx") and _requests_download(raw, dest):
+                        continue
             if try_download_from_page(url, dest):
-                logger.info(f"Downloaded model found on page {url}")
                 continue
-            # fallback to using user's download_manager if available
             try:
                 download_manager(url, mdxnet_models_dir)
-                # move any found .onnx into dest if needed
+                # try to find a .onnx in the folder
                 found = None
                 for root, _, files in os.walk(mdxnet_models_dir):
                     for f in files:
@@ -190,10 +162,7 @@ def download_models_from_list():
                 logger.warning(f"download_manager fallback failed for {url}: {e}")
             logger.warning(f"Could not download model from: {url}. Place file manually into {mdxnet_models_dir}")
 
-# ------------------- MDX classes (kept similar to original) -------------------
-# For brevity, core MDX classes are kept largely compatible with your existing code.
-# These were in your original file and are necessary for the MDX ONNX sessions to work.
-
+# MDX classes (kept compatible with original usage)
 class MDXModel:
     def __init__(self, device, dim_f, dim_t, n_fft, hop=1024, stem_name=None, compensation=1.0):
         self.dim_f = dim_f
@@ -236,7 +205,6 @@ class MDX:
         self.provider = ["CUDAExecutionProvider"] if processor >= 0 else ["CPUExecutionProvider"]
         self.model = params
         self.ort = ort.InferenceSession(model_path, providers=self.provider)
-        # warmup
         try:
             self.ort.run(None, {"input": torch.rand(1, 4, params.dim_f, params.dim_t).numpy()})
         except Exception:
@@ -331,8 +299,7 @@ class MDX:
         assert len(processed_batches) == len(waves), "Incomplete processed batches, please reduce batch size!"
         return self.segment(processed_batches, True, chunk)
 
-# ------------------- Aggressive vocal cleaning (HPSS + median mask) -------------------
-
+# Aggressive vocal cleaning (HPSS + median mask)
 def _smooth_mask(mask: np.ndarray, freq_smooth: int = 3, time_smooth: int = 15) -> np.ndarray:
     if freq_smooth <= 1 and time_smooth <= 1:
         return mask
@@ -349,28 +316,17 @@ def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
                            freq_smooth: int = 3, time_smooth: int = 15,
                            use_hpss: bool = True, percussive_attenuation: float = 0.12,
                            median_time: int = 9, process_mono: bool = True):
-    """
-    Aggressive cleaning function with HPSS, median temporal mask filtering and adaptive noise estimate.
-    process_mono: if True, convert to mono internally to speed up processing.
-    """
     try:
         data, file_sr = sf.read(input_path, always_2d=True)
-        # data shape: (frames, channels)
-        # convert to channels x samples
         if data.ndim == 2:
-            channels = data.shape[1]
             data = data.T
         else:
             data = data.reshape((1, -1))
-
-        # Optionally convert to mono for speed
         if process_mono and data.shape[0] > 1:
             mono = np.mean(data, axis=0)
             data_proc = np.expand_dims(mono, axis=0)
         else:
             data_proc = data
-
-        # resample if needed
         if file_sr != sr:
             resampled = []
             for ch in range(data_proc.shape[0]):
@@ -378,7 +334,6 @@ def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
                 resampled.append(resampled_ch)
             data_proc = np.stack(resampled, axis=0)
             file_sr = sr
-
         def _median_filter_1d(arr, win):
             if win <= 1:
                 return arr
@@ -388,12 +343,9 @@ def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
             for i in range(len(arr)):
                 out[i] = np.median(a[i:i + win])
             return out
-
         cleaned_ch = []
         for ch in range(data_proc.shape[0]):
             y = data_proc[ch].astype(np.float32)
-
-            # HPSS splitting to attenuate percussive transients if requested
             if use_hpss:
                 try:
                     y_harm, y_perc = librosa.effects.hpss(y)
@@ -404,46 +356,34 @@ def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
                     S_full = librosa.stft(y, n_fft=n_fft, hop_length=hop_length, window='hann')
             else:
                 S_full = librosa.stft(y, n_fft=n_fft, hop_length=hop_length, window='hann')
-
             mag = np.abs(S_full)
             phase = np.angle(S_full)
-
             frame_energy = np.mean(mag, axis=0)
             perc10 = np.percentile(frame_energy, 10)
             noise_frames_idx = np.where(frame_energy <= perc10)[0]
             if noise_frames_idx.size == 0:
                 noise_frames_idx = np.arange(min(10, mag.shape[1]))
             noise_mag = np.median(mag[:, noise_frames_idx], axis=1, keepdims=True)
-
             mag_sub = mag - noise_mag * prop_decrease
             mag_sub = np.maximum(mag_sub, 0.0)
             eps = 1e-8
             mask = mag_sub / (mag + eps)
             thresh_matrix = (noise_mag * n_std_thresh)
             mask = np.where(mag > thresh_matrix, mask, 0.0)
-
-            # median time filter on mask to remove short transients
             if median_time > 1:
                 mask_med = np.zeros_like(mask)
                 for f in range(mask.shape[0]):
                     mask_med[f, :] = _median_filter_1d(mask[f, :], median_time)
                 mask = mask_med
-
             mask = _smooth_mask(mask, freq_smooth=freq_smooth, time_smooth=time_smooth)
             mask = np.clip(mask, 0.0, 1.0)
             mask = mask ** 1.12
-
             S_clean = mask * S_full
             y_clean = librosa.istft(S_clean, hop_length=hop_length, window='hann', length=len(y))
-
-            # DC removal and gentle HPF to remove rumble below 60-80Hz
             if len(y_clean) > 0:
                 y_clean = y_clean - np.mean(y_clean)
             cleaned_ch.append(y_clean)
-
-        # If we processed mono but original was stereo, replicate
         if process_mono and data.shape[0] > 1:
-            # cleaned_ch contains one channel
             out_signal = cleaned_ch[0]
             out_wav = np.stack([out_signal, out_signal], axis=1)
             sf.write(output_path, out_wav, file_sr)
@@ -452,26 +392,21 @@ def aggressive_vocal_clean(input_path: str, output_path: str, sr: int = 44100,
             cleaned = np.stack([np.pad(c, (0, maxlen - len(c)), mode='constant') for c in cleaned_ch], axis=0)
             out = cleaned.T
             sf.write(output_path, out, file_sr)
-
         return output_path
-
     except Exception as e:
         logger.exception(f"aggressive_vocal_clean error: {e}")
-        # fallback: copy original
         try:
             shutil.copy(input_path, output_path)
             return output_path
         except Exception:
             return input_path
 
-# ------------------- Effects using Pedalboard (kept) -------------------
-
+# Pedalboard effects
 def add_vocal_effects(input_file, output_file,
                       reverb_room_size=0.6, vocal_reverb_dryness=0.8, reverb_damping=0.6, reverb_wet_level=0.35,
                       delay_seconds=0.4, delay_mix=0.25,
                       compressor_threshold_db=-25, compressor_ratio=3.5, compressor_attack_ms=10, compressor_release_ms=60,
                       gain_db=3, extreme_clean: bool = False,
-                      # advanced cleaning tuning (exposed via UI if desired)
                       clean_n_fft=4096, clean_hop=512, clean_percussive_atten=0.08, clean_median_time=11,
                       clean_process_mono=True, clean_use_hpss=True):
     tmp_clean = input_file
@@ -479,14 +414,12 @@ def add_vocal_effects(input_file, output_file,
         try:
             base, ext = os.path.splitext(os.path.abspath(input_file))
             tmp_clean = base + "_extremeclean" + ext
-            # call aggressive cleaner with provided params
             aggressive_vocal_clean(input_file, tmp_clean,
                                    sr=44100, n_fft=clean_n_fft, hop_length=clean_hop,
                                    n_std_thresh=1.2, prop_decrease=1.2,
                                    freq_smooth=5, time_smooth=25,
                                    use_hpss=clean_use_hpss, percussive_attenuation=clean_percussive_atten,
                                    median_time=clean_median_time, process_mono=clean_process_mono)
-            # disable reverb/delay for extreme clean output
             reverb_room_size = 0.0
             reverb_wet_level = 0.0
             delay_seconds = 0.0
@@ -494,21 +427,14 @@ def add_vocal_effects(input_file, output_file,
         except Exception as e:
             logger.exception("extreme clean failed: %s", e)
             tmp_clean = input_file
-
     effects = [HighpassFilter()]
-
     if reverb_room_size > 0 and reverb_wet_level > 0:
         effects.append(Reverb(room_size=reverb_room_size, damping=reverb_damping, wet_level=reverb_wet_level, dry_level=vocal_reverb_dryness))
-
-    effects.append(Compressor(threshold_db=compressor_threshold_db, ratio=compressor_ratio,
-                              attack_ms=compressor_attack_ms, release_ms=compressor_release_ms))
-
+    effects.append(Compressor(threshold_db=compressor_threshold_db, ratio=compressor_ratio, attack_ms=compressor_attack_ms, release_ms=compressor_release_ms))
     if delay_seconds > 0 and delay_mix > 0:
         effects.append(Delay(delay_seconds=delay_seconds, mix=delay_mix))
-
     if gain_db:
         effects.append(Gain(gain_db=gain_db))
-
     board = Pedalboard(effects)
     with AudioFile(tmp_clean) as f:
         with AudioFile(output_file, 'w', f.samplerate, f.num_channels) as o:
@@ -516,18 +442,14 @@ def add_vocal_effects(input_file, output_file,
                 chunk = f.read(int(f.samplerate))
                 effected = board(chunk, f.samplerate, reset=False)
                 o.write(effected)
-
-    # remove temp
     if extreme_clean and tmp_clean != input_file and os.path.exists(tmp_clean):
         try:
             os.remove(tmp_clean)
         except Exception:
             pass
 
-# ------------------- Format conversion and util functions (kept) -------------------
-
+# Utilities for saving/conversion
 COMMON_SAMPLE_RATES = [8000, 16000, 22050, 32000, 44100, 48000, 96000]
-
 def save_audio(audio_opt: np.ndarray, final_sr: int, output_audio_path: str, target_format: str) -> str:
     ext = os.path.splitext(output_audio_path)[1].lower()
     try:
@@ -561,177 +483,69 @@ def convert_format(file_paths, media_dir, target_format):
         converted_files.append(saved_path)
     return converted_files
 
-# ------------------- UI helpers (kept and extended) -------------------
+# UI component factories
+def downloader_conf(): return gr.Checkbox(False, label="URL-to-Audio", container=False)
+def url_media_conf(): return gr.Textbox(value="", label="Enter URL", placeholder="www.youtube.com/...", visible=False, lines=1)
+def url_button_conf(): return gr.Button("Go", variant="secondary", visible=False)
+def audio_conf(): return gr.File(label="Audio file", type="filepath", container=True)
+def stem_conf(): return gr.CheckboxGroup(choices=["vocal", "background"], value="vocal", label="Stem")
+def main_conf(): return gr.Checkbox(False, label="Main")
+def dereverb_conf(): return gr.Checkbox(False, label="Dereverb", visible=True)
+def vocal_effects_conf(): return gr.Checkbox(False, label="Vocal Effects", visible=True)
+def deep_filter_conf(): return gr.Checkbox(False, label="Enable Neural Enhancement (model in mdx_models/)", visible=True)
+def fast_mode_conf(): return gr.Checkbox(True, label="Fast mode (less aggressive, faster)", visible=True)
+def background_effects_conf(): return gr.Checkbox(False, label="Background Effects", visible=False)
+def vocal_reverb_room_size_conf(): return gr.Number(0.15, label="Vocal Reverb Room Size", minimum=0.0, maximum=1.0, step=0.05, visible=True)
+def vocal_reverb_damping_conf(): return gr.Number(0.7, label="Vocal Reverb Damping", minimum=0.0, maximum=1.0, step=0.01, visible=True)
+def vocal_reverb_wet_level_conf(): return gr.Number(0.2, label="Vocal Reverb Wet Level", minimum=0.0, maximum=1.0, step=0.05, visible=True)
+def vocal_reverb_dryness_level_conf(): return gr.Number(0.8, label="Vocal Reverb Dryness Level", minimum=0.0, maximum=1.0, step=0.05, visible=True)
+def vocal_delay_seconds_conf(): return gr.Number(0., label="Vocal Delay Seconds", minimum=0.0, maximum=1.0, step=0.01, visible=True)
+def vocal_delay_mix_conf(): return gr.Number(0., label="Vocal Delay Mix", minimum=0.0, maximum=1.0, step=0.01, visible=True)
+def vocal_compressor_threshold_db_conf(): return gr.Number(-15, label="Vocal Compressor Threshold (dB)", minimum=-60, maximum=0, step=1, visible=True)
+def vocal_compressor_ratio_conf(): return gr.Number(4., label="Vocal Compressor Ratio", minimum=0, maximum=20, step=0.1, visible=True)
+def vocal_compressor_attack_ms_conf(): return gr.Number(1.0, label="Vocal Compressor Attack (ms)", minimum=0, maximum=1000, step=1, visible=True)
+def vocal_compressor_release_ms_conf(): return gr.Number(100, label="Vocal Compressor Release (ms)", minimum=0, maximum=3000, step=1, visible=True)
+def vocal_gain_db_conf(): return gr.Number(0, label="Vocal Gain (dB)", minimum=-40, maximum=40, step=1, visible=True)
+def percussive_attenuation_conf(): return gr.Number(0.08, label="Percussive attenuation (0..1)", minimum=0.0, maximum=1.0, step=0.01, visible=True)
+def median_time_conf(): return gr.Number(11, label="Mask median time (frames)", minimum=1, maximum=51, step=2, visible=True)
+def clean_n_fft_conf(): return gr.Dropdown(choices=[2048, 3072, 4096], value=4096, label="Cleaning n_fft", visible=True)
+def button_conf(): return gr.Button("Inference", variant="primary")
+def output_conf(): return gr.File(label="Result", file_count="multiple", interactive=False)
 
-def downloader_conf():
-    return gr.Checkbox(False, label="URL-to-Audio", container=False)
+# Generic ONNX runner (best-effort)
+def run_generic_onnx_audio_model(model_path: str, input_wav: str, output_wav: str, model_sr: int = None):
+    sess = ort.InferenceSession(model_path, providers=(["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]))
+    wav, sr = sf.read(input_wav, always_2d=True)
+    mono = np.mean(wav, axis=1).astype(np.float32)
+    if model_sr is None:
+        model_sr = sr
+    if sr != model_sr:
+        mono_rs = librosa.resample(mono, orig_sr=sr, target_sr=model_sr)
+    else:
+        mono_rs = mono
+    peak = np.max(np.abs(mono_rs)) + 1e-9
+    mono_rs = mono_rs / peak
+    input_name = sess.get_inputs()[0].name
+    arr = mono_rs.astype(np.float32)[None, :]
+    try:
+        out = sess.run(None, {input_name: arr})[0]
+    except Exception:
+        try:
+            out = sess.run(None, {input_name: arr[None, ...]})[0]
+        except Exception as e:
+            raise RuntimeError(f"ONNX inference failed: {e}")
+    out_signal = np.array(out).squeeze()
+    out_signal = out_signal * peak
+    if model_sr != sr:
+        out_signal = librosa.resample(out_signal, orig_sr=model_sr, target_sr=sr)
+    if wav.shape[1] > 1:
+        out_wav = np.stack([out_signal, out_signal], axis=1)
+    else:
+        out_wav = out_signal.reshape(-1, 1)
+    sf.write(output_wav, out_wav, sr)
+    return output_wav
 
-def url_media_conf():
-    return gr.Textbox(value="", label="Enter URL", placeholder="www.youtube.com/...", visible=False, lines=1)
-
-def url_button_conf():
-    return gr.Button("Go", variant="secondary", visible=False)
-
-def audio_conf():
-    return gr.File(label="Audio file", type="filepath", container=True)
-
-def stem_conf():
-    return gr.CheckboxGroup(choices=["vocal", "background"], value="vocal", label="Stem")
-
-def main_conf():
-    return gr.Checkbox(False, label="Main")
-
-def dereverb_conf():
-    return gr.Checkbox(False, label="Dereverb", visible=True)
-
-def vocal_effects_conf():
-    return gr.Checkbox(False, label="Vocal Effects", visible=True)
-
-def deep_filter_conf():
-    return gr.Checkbox(False, label="Enable Neural Enhancement (model in mdx_models/)", visible=True)
-
-def fast_mode_conf():
-    return gr.Checkbox(True, label="Fast mode (less aggressive, much faster)", visible=True)
-
-def vocal_reverb_room_size_conf():
-    return gr.Number(0.15, label="Vocal Reverb Room Size", minimum=0.0, maximum=1.0, step=0.05, visible=True)
-
-def vocal_reverb_damping_conf():
-    return gr.Number(0.7, label="Vocal Reverb Damping", minimum=0.0, maximum=1.0, step=0.01, visible=True)
-
-def vocal_reverb_wet_level_conf():
-    return gr.Number(0.2, label="Vocal Reverb Wet Level", minimum=0.0, maximum=1.0, step=0.05, visible=True)
-
-def vocal_reverb_dryness_level_conf():
-    return gr.Number(0.8, label="Vocal Reverb Dryness Level", minimum=0.0, maximum=1.0, step=0.05, visible=True)
-
-def vocal_delay_seconds_conf():
-    return gr.Number(0., label="Vocal Delay Seconds", minimum=0.0, maximum=1.0, step=0.01, visible=True)
-
-def vocal_delay_mix_conf():
-    return gr.Number(0., label="Vocal Delay Mix", minimum=0.0, maximum=1.0, step=0.01, visible=True)
-
-def vocal_compressor_threshold_db_conf():
-    return gr.Number(-15, label="Vocal Compressor Threshold (dB)", minimum=-60, maximum=0, step=1, visible=True)
-
-def vocal_compressor_ratio_conf():
-    return gr.Number(4., label="Vocal Compressor Ratio", minimum=0, maximum=20, step=0.1, visible=True)
-
-def vocal_compressor_attack_ms_conf():
-    return gr.Number(1.0, label="Vocal Compressor Attack (ms)", minimum=0, maximum=1000, step=1, visible=True)
-
-def vocal_compressor_release_ms_conf():
-    return gr.Number(100, label="Vocal Compressor Release (ms)", minimum=0, maximum=3000, step=1, visible=True)
-
-def vocal_gain_db_conf():
-    return gr.Number(0, label="Vocal Gain (dB)", minimum=-40, maximum=40, step=1, visible=True)
-
-def percussive_attenuation_conf():
-    return gr.Number(0.08, label="Percussive attenuation (0..1)", minimum=0.0, maximum=1.0, step=0.01, visible=True)
-
-def median_time_conf():
-    return gr.Number(11, label="Mask median time (frames)", minimum=1, maximum=51, step=2, visible=True)
-
-def clean_n_fft_conf():
-    return gr.Dropdown(choices=[2048, 3072, 4096], value=4096, label="Cleaning n_fft", visible=True)
-
-def button_conf():
-    return gr.Button("Inference", variant="primary")
-
-def output_conf():
-    return gr.File(label="Result", file_count="multiple", interactive=False)
-
-def show_vocal_components(value_name):
-    v_ = "vocal" in value_name
-    b_ = "background" in value_name
-    return gr.update(visible=v_), gr.update(visible=v_), gr.update(visible=v_), gr.update(visible=b_)
-
-FORMAT_OPTIONS = ["WAV", "MP3", "FLAC"]
-
-def format_conf():
-    return gr.Dropdown(choices=FORMAT_OPTIONS, value=FORMAT_OPTIONS[0], label="Format output:")
-
-# ------------------- GUI (keeps behaviour, exposes new options) -------------------
-
-def get_gui(theme):
-    with gr.Blocks(theme=theme, fill_width=True, fill_height=False, delete_cache=(3200, 10800)) as app:
-        gr.Markdown(title)
-        gr.Markdown(description)
-
-        downloader_gui = downloader_conf()
-        with gr.Row():
-            with gr.Column(scale=2):
-                url_media_gui = url_media_conf()
-            with gr.Column(scale=1):
-                url_button_gui = url_button_conf()
-
-        downloader_gui.change(show_components_downloader, [downloader_gui], [url_media_gui, url_button_gui])
-
-        aud = audio_conf()
-
-        url_button_gui.click(lambda url: audio_downloader(url), [url_media_gui], [aud])
-
-        with gr.Column():
-            with gr.Row():
-                stem_gui = stem_conf()
-
-        with gr.Column():
-            with gr.Row():
-                main_gui = main_conf()
-                dereverb_gui = dereverb_conf()
-                vocal_effects_gui = vocal_effects_conf()
-                deep_filter_gui = deep_filter_conf()
-                fast_mode_gui = fast_mode_conf()
-                background_effects_gui = gr.Checkbox(False, label="Background Effects", visible=False)
-
-            with gr.Accordion("Vocal Effects Parameters", open=False):
-                with gr.Row():
-                    vocal_reverb_room_size_gui = vocal_reverb_room_size_conf()
-                    vocal_reverb_damping_gui = vocal_reverb_damping_conf()
-                    vocal_reverb_dryness_gui = vocal_reverb_dryness_level_conf()
-                    vocal_reverb_wet_level_gui = vocal_reverb_wet_level_conf()
-                    vocal_delay_seconds_gui = vocal_delay_seconds_conf()
-                    vocal_delay_mix_gui = vocal_delay_mix_conf()
-                    vocal_compressor_threshold_db_gui = vocal_compressor_threshold_db_conf()
-                    vocal_compressor_ratio_gui = vocal_compressor_ratio_conf()
-                    vocal_compressor_attack_ms_gui = vocal_compressor_attack_ms_conf()
-                    vocal_compressor_release_ms_gui = vocal_compressor_release_ms_conf()
-                    vocal_gain_db_gui = vocal_gain_db_conf()
-                    percussive_attenuation_gui = percussive_attenuation_conf()
-                    median_time_gui = median_time_conf()
-                    clean_n_fft_gui = clean_n_fft_conf()
-
-            stem_gui.change(show_vocal_components, [stem_gui], [main_gui, dereverb_gui, vocal_effects_gui, background_effects_gui])
-
-        target_format_gui = format_conf()
-        button_base = button_conf()
-        output_base = output_conf()
-
-        # Bind inference button
-        button_base.click(
-            sound_separate,
-            inputs=[
-                aud,
-                stem_gui,
-                main_gui,
-                dereverb_gui,
-                vocal_effects_gui,
-                background_effects_gui,
-                vocal_reverb_room_size_gui, vocal_reverb_damping_gui, vocal_reverb_dryness_gui, vocal_reverb_wet_level_gui,
-                vocal_delay_seconds_gui, vocal_delay_mix_gui, vocal_compressor_threshold_db_gui, vocal_compressor_ratio_gui,
-                vocal_compressor_attack_ms_gui, vocal_compressor_release_ms_gui, vocal_gain_db_gui,
-                gr.Number(120, visible=False), gr.Number(11000, visible=False), gr.Number(0.5, visible=False),
-                gr.Number(0.5, visible=False), gr.Number(-15, visible=False), gr.Number(4.0, visible=False),
-                percussive_attenuation_gui, median_time_gui, clean_n_fft_gui, fast_mode_gui, deep_filter_gui, target_format_gui
-            ],
-            outputs=[output_base],
-            _js=None,
-        )
-
-        gr.Markdown(RESOURCES)
-    return app
-
-# ------------------- Audio downloader (simple wrapper using yt_dlp) -------------------
+# Minimal audio downloader wrapper (yt_dlp)
 def audio_downloader(url_media):
     url_media = url_media.strip()
     if not url_media:
@@ -762,46 +576,40 @@ def audio_downloader(url_media):
         logger.exception(f"audio_downloader failed: {e}")
         return None
 
-# ------------------- process_uvr_task and run_mdx (kept from original) -------------------
-# For brevity we rely on your original run_mdx and run_mdx_beta implementations.
-# Insert your original run_mdx and run_mdx_beta here unchanged. (They are long and present in your file.)
+# The process_uvr_task, run_mdx and run_mdx_beta functions should be copied from your original file unchanged.
+# For brevity in this packaged file we assume they are present and unchanged. Paste them here in your actual code.
+# -----------------------------------------------------------------------------
+# IMPORTANT: To keep this file functional, ensure run_mdx, run_mdx_beta and process_uvr_task
+# implementations from your original code are present above this line.
+# -----------------------------------------------------------------------------
 
-# ------------------- sound_separate main flow (integrates everything) -------------------
-
+# Main orchestrator (matches UI inputs)
 def sound_separate(
-    media_file, stem, main, dereverb, vocal_effects=True, background_effects=True,
-    vocal_reverb_room_size=0.6, vocal_reverb_damping=0.6, vocal_reverb_dryness=0.8, vocal_reverb_wet_level=0.35,
-    vocal_delay_seconds=0.4, vocal_delay_mix=0.25,
-    vocal_compressor_threshold_db=-25, vocal_compressor_ratio=3.5, vocal_compressor_attack_ms=10, vocal_compressor_release_ms=60,
-    vocal_gain_db=4,
-    background_highpass_freq=120, background_lowpass_freq=11000,
-    background_reverb_room_size=0.5, background_reverb_damping=0.5, background_reverb_wet_level=0.25,
-    background_compressor_threshold_db=-20, background_compressor_ratio=2.5, background_compressor_attack_ms=15, background_compressor_release_ms=80,
-    background_gain_db=3,
-    percussive_attenuation=0.08, median_time=11, clean_n_fft=4096, fast_mode=True, enable_deepfilter=False,
-    target_format="WAV",
+    media_file, stem, main, dereverb, vocal_effects, background_effects,
+    vocal_reverb_room_size, vocal_reverb_damping, vocal_reverb_dryness, vocal_reverb_wet_level,
+    vocal_delay_seconds, vocal_delay_mix, vocal_compressor_threshold_db, vocal_compressor_ratio,
+    vocal_compressor_attack_ms, vocal_compressor_release_ms, vocal_gain_db,
+    background_highpass_freq, background_lowpass_freq, background_reverb_room_size,
+    background_reverb_damping, background_reverb_wet_level, background_compressor_threshold_db,
+    background_compressor_ratio, background_compressor_attack_ms, background_compressor_release_ms,
+    background_gain_db,
+    percussive_attenuation, median_time, clean_n_fft, fast_mode, enable_deepfilter, target_format
 ):
-    """
-    Main orchestrator for separation + cleaning pipeline.
-    - fast_mode=True will favor speed (less aggressive cleaning params).
-    - enable_deepfilter triggers an enhancement model only if a matching model file (.onnx) is found in mdx_models/.
-    """
+    # Download any user-specified models (if provided)
+    download_models_from_list()
+
     if not media_file:
         raise ValueError("The audio path is missing.")
     if not stem:
         raise ValueError("Please select 'vocal' or 'background' stem.")
 
-    # Attempt to download user-specified model links if any
-    download_models_from_list()
-
-    # Basic info
     media_file = os.path.abspath(media_file)
     media_dir = os.path.dirname(media_file)
     outputs = []
 
     start_time = time.time()
 
-    # Determine cleaning params depending on fast/quality
+    # cleaning params
     if fast_mode:
         clean_n_fft = 2048
         clean_hop = 512
@@ -813,67 +621,61 @@ def sound_separate(
         clean_n_fft = int(clean_n_fft)
         clean_hop = 512
         clean_percussive_atten = percussive_attenuation
-        clean_median_time = median_time
+        clean_median_time = int(median_time)
         clean_use_hpss = True
         clean_process_mono = True
 
-    # Run separation
+    # VOCAL
     if "vocal" in stem:
         try:
-            # process_uvr_task returns tuple: vocals_path, instrumentals_path, backup, main, dereverb_path
-            _, _, _, _, vocal_audio = process_uvr_task(orig_song_path=media_file, song_id=get_hash(media_file)+"_mdx",
+            # process_uvr_task must be available (from original file)
+            _, _, _, _, vocal_audio = process_uvr_task(orig_song_path=media_file, song_id=get_hash(media_file) + "_mdx",
                                                        main_vocals=main, dereverb=dereverb, remove_files_output_dir=False)
-            # If we have vocal effects enabled: extreme clean + pedalboard processing
             if vocal_effects:
                 file_name, file_extension = os.path.splitext(os.path.abspath(vocal_audio))
-                out_effects = file_name + "_effects" + file_extension
-                out_effects_path = os.path.join(media_dir, out_effects)
+                out_effects_path = os.path.join(media_dir, file_name + "_effects" + file_extension)
                 add_vocal_effects(vocal_audio, out_effects_path,
                                   reverb_room_size=vocal_reverb_room_size, vocal_reverb_dryness=vocal_reverb_dryness,
                                   reverb_damping=vocal_reverb_damping, reverb_wet_level=vocal_reverb_wet_level,
                                   delay_seconds=vocal_delay_seconds, delay_mix=vocal_delay_mix,
                                   compressor_threshold_db=vocal_compressor_threshold_db, compressor_ratio=vocal_compressor_ratio,
                                   compressor_attack_ms=vocal_compressor_attack_ms, compressor_release_ms=vocal_compressor_release_ms,
-                                  gain_db=vocal_gain_db,
-                                  extreme_clean=True,
+                                  gain_db=vocal_gain_db, extreme_clean=True,
                                   clean_n_fft=clean_n_fft, clean_hop=clean_hop,
                                   clean_percussive_atten=clean_percussive_atten, clean_median_time=clean_median_time,
                                   clean_process_mono=clean_process_mono, clean_use_hpss=clean_use_hpss)
                 vocal_audio = out_effects_path
 
-            # Optional neural enhancement: only if ONNX models exist in mdx_models/ (user provided)
-            if enable_deepfilter:
-                # look for a candidate ONNX by name pattern "deep" or "denoise"
-                candidate = None
-                for f in os.listdir(mdxnet_models_dir):
-                    lf = f.lower()
-                    if lf.endswith(".onnx") and ("deep" in lf or "denoise" in lf or "filter" in lf):
-                        candidate = os.path.join(mdxnet_models_dir, f)
-                        break
-                if candidate:
-                    # run enhancement (model-specific infer wrapper should be implemented by user if model has special inputs)
-                    enhanced_path = os.path.splitext(vocal_audio)[0] + "_enhanced.wav"
-                    try:
-                        # Generic ONNX audio enhancer: this will attempt common input shapes; some models require custom wrappers.
-                        run_generic_onnx_audio_model(candidate, vocal_audio, enhanced_path, model_sr=None)
-                        vocal_audio = enhanced_path
-                    except Exception as e:
-                        logger.warning(f"Neural enhancement failed with {candidate}: {e}")
-                else:
-                    logger.info("No enhancement ONNX model found in mdx_models/ — skipping neural enhancement.")
+                # Neural enhancement if user provided ONNX with "deep/denoise/filter" in filename
+                if enable_deepfilter:
+                    candidate = None
+                    for f in os.listdir(mdxnet_models_dir):
+                        lf = f.lower()
+                        if lf.endswith(".onnx") and ("deep" in lf or "denoise" in lf or "filter" in lf):
+                            candidate = os.path.join(mdxnet_models_dir, f)
+                            break
+                    if candidate:
+                        enhanced_path = os.path.splitext(vocal_audio)[0] + "_enhanced.wav"
+                        try:
+                            run_generic_onnx_audio_model(candidate, vocal_audio, enhanced_path, model_sr=None)
+                            vocal_audio = enhanced_path
+                        except Exception as e:
+                            logger.warning(f"Neural enhancement failed with {candidate}: {e}")
+                    else:
+                        logger.info("No enhancement ONNX model found in mdx_models/ — skipping neural enhancement.")
 
             outputs.append(vocal_audio)
         except Exception as e:
             logger.exception(f"Vocal separation/processing failed: {e}")
 
+    # BACKGROUND
     if "background" in stem:
         try:
-            background_audio, _ = process_uvr_task(orig_song_path=media_file, song_id=get_hash(media_file)+"_voiceless",
+            background_audio, _ = process_uvr_task(orig_song_path=media_file, song_id=get_hash(media_file) + "_voiceless",
                                                    only_voiceless=True, remove_files_output_dir=False)
             if background_effects:
                 file_name, file_extension = os.path.splitext(os.path.abspath(background_audio))
-                out_effects = file_name + "_effects" + file_extension
-                out_effects_path = os.path.join(media_dir, out_effects)
+                out_effects_path = os.path.join(media_dir, file_name + "_effects" + file_extension)
                 add_instrumental_effects(background_audio, out_effects_path,
                                          highpass_freq=background_highpass_freq, lowpass_freq=background_lowpass_freq,
                                          reverb_room_size=background_reverb_room_size, reverb_damping=background_reverb_damping,
@@ -896,54 +698,104 @@ def sound_separate(
 
     return convert_format(outputs, media_dir, target_format)
 
-# ------------------- Generic ONNX audio model runner (best-effort) -------------------
-def run_generic_onnx_audio_model(model_path: str, input_wav: str, output_wav: str, model_sr: int = None):
-    """
-    Best-effort runner for ONNX models that take raw waveform as input.
-    This is intentionally generic and may not work with every model — for specific models,
-    write a custom wrapper that matches the model I/O.
-    """
-    sess = ort.InferenceSession(model_path, providers=(["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]))
-    # load audio, convert to mono
-    wav, sr = sf.read(input_wav, always_2d=True)
-    mono = np.mean(wav, axis=1).astype(np.float32)
-    if model_sr is None:
-        model_sr = sr
-    if sr != model_sr:
-        mono_rs = librosa.resample(mono, orig_sr=sr, target_sr=model_sr)
-    else:
-        mono_rs = mono
-    # normalize
-    peak = np.max(np.abs(mono_rs)) + 1e-9
-    mono_rs = mono_rs / peak
-    # attempt input names
-    inputs = sess.get_inputs()
-    input_name = inputs[0].name
-    arr = mono_rs.astype(np.float32)[None, :]
-    try:
-        out = sess.run(None, {input_name: arr})[0]
-    except Exception:
-        try:
-            out = sess.run(None, {input_name: arr[None, ...]})[0]
-        except Exception as e:
-            raise RuntimeError(f"ONNX model inference failed: {e}")
-    out_signal = np.array(out).squeeze()
-    out_signal = out_signal * peak
-    if model_sr != sr:
-        out_signal = librosa.resample(out_signal, orig_sr=model_sr, target_sr=sr)
-    if wav.shape[1] > 1:
-        out_wav = np.stack([out_signal, out_signal], axis=1)
-    else:
-        out_wav = out_signal.reshape(-1, 1)
-    sf.write(output_wav, out_wav, sr)
-    return output_wav
+# Build UI
+def get_gui(theme):
+    with gr.Blocks(theme=theme, fill_width=True, fill_height=False, delete_cache=(3200, 10800)) as app:
+        gr.Markdown(title)
+        gr.Markdown(description)
 
-# ------------------- Launch block -------------------
+        downloader_gui = downloader_conf()
+        with gr.Row():
+            with gr.Column(scale=2):
+                url_media_gui = url_media_conf()
+            with gr.Column(scale=1):
+                url_button_gui = url_button_conf()
+
+        downloader_gui.change(show_components_downloader, [downloader_gui], [url_media_gui, url_button_gui])
+
+        aud = audio_conf()
+        url_button_gui.click(lambda url: audio_downloader(url), [url_media_gui], [aud])
+
+        with gr.Column():
+            with gr.Row():
+                stem_gui = stem_conf()
+
+        with gr.Column():
+            with gr.Row():
+                main_gui = main_conf()
+                dereverb_gui = dereverb_conf()
+                vocal_effects_gui = vocal_effects_conf()
+                deep_filter_gui = deep_filter_conf()
+                fast_mode_gui = fast_mode_conf()
+                background_effects_gui = background_effects_conf()
+
+            with gr.Accordion("Vocal Effects Parameters", open=False):
+                with gr.Row():
+                    vocal_reverb_room_size_gui = vocal_reverb_room_size_conf()
+                    vocal_reverb_damping_gui = vocal_reverb_damping_conf()
+                    vocal_reverb_dryness_gui = vocal_reverb_dryness_level_conf()
+                    vocal_reverb_wet_level_gui = vocal_reverb_wet_level_conf()
+                    vocal_delay_seconds_gui = vocal_delay_seconds_conf()
+                    vocal_delay_mix_gui = vocal_delay_mix_conf()
+                    vocal_compressor_threshold_db_gui = vocal_compressor_threshold_db_conf()
+                    vocal_compressor_ratio_gui = vocal_compressor_ratio_conf()
+                    vocal_compressor_attack_ms_gui = vocal_compressor_attack_ms_conf()
+                    vocal_compressor_release_ms_gui = vocal_compressor_release_ms_conf()
+                    vocal_gain_db_gui = vocal_gain_db_conf()
+                    percussive_attenuation_gui = percussive_attenuation_conf()
+                    median_time_gui = median_time_conf()
+                    clean_n_fft_gui = clean_n_fft_conf()
+
+            with gr.Accordion("Background Effects Parameters", open=False):
+                with gr.Row():
+                    background_highpass_freq_gui = gr.Number(120, label="Background Highpass Frequency (Hz)", visible=True)
+                    background_lowpass_freq_gui = gr.Number(11000, label="Background Lowpass Frequency (Hz)", visible=True)
+                    background_reverb_room_size_gui = gr.Number(0.1, label="Background Reverb Room Size", visible=True)
+                    background_reverb_damping_gui = gr.Number(0.5, label="Background Reverb Damping", visible=True)
+                    background_reverb_wet_level_gui = gr.Number(0.25, label="Background Reverb Wet Level", visible=True)
+                    background_compressor_threshold_db_gui = gr.Number(-15, label="Background Compressor Threshold (dB)", visible=True)
+                    background_compressor_ratio_gui = gr.Number(4.0, label="Background Compressor Ratio", visible=True)
+                    background_compressor_attack_ms_gui = gr.Number(15, label="Background Compressor Attack (ms)", visible=True)
+                    background_compressor_release_ms_gui = gr.Number(60, label="Background Compressor Release (ms)", visible=True)
+                    background_gain_db_gui = gr.Number(0, label="Background Gain (dB)", visible=True)
+
+            stem_gui.change(lambda v: (gr.update(visible="vocal" in v), gr.update(visible="vocal" in v), gr.update(visible="vocal" in v), gr.update(visible="background" in v)), [stem_gui], [main_gui, dereverb_gui, vocal_effects_gui, background_effects_gui])
+
+        target_format_gui = format_conf()
+        button_base = button_conf()
+        output_base = output_conf()
+
+        # Bind inference button (inputs must match sound_separate signature)
+        button_base.click(
+            sound_separate,
+            inputs=[
+                aud,
+                stem_gui,
+                main_gui,
+                dereverb_gui,
+                vocal_effects_gui,
+                background_effects_gui,
+                vocal_reverb_room_size_gui, vocal_reverb_damping_gui, vocal_reverb_dryness_gui, vocal_reverb_wet_level_gui,
+                vocal_delay_seconds_gui, vocal_delay_mix_gui, vocal_compressor_threshold_db_gui, vocal_compressor_ratio_gui,
+                vocal_compressor_attack_ms_gui, vocal_compressor_release_ms_gui, vocal_gain_db_gui,
+                background_highpass_freq_gui, background_lowpass_freq_gui, background_reverb_room_size_gui,
+                background_reverb_damping_gui, background_reverb_wet_level_gui, background_compressor_threshold_db_gui,
+                background_compressor_ratio_gui, background_compressor_attack_ms_gui, background_compressor_release_ms_gui,
+                background_gain_db_gui,
+                percussive_attenuation_gui, median_time_gui, clean_n_fft_gui, fast_mode_gui, deep_filter_gui, target_format_gui
+            ],
+            outputs=[output_base],
+        )
+
+        gr.Markdown(RESOURCES)
+    return app
+
+# Launch
 if __name__ == "__main__":
-    # attempt to download any user-provided model links (model_links.txt)
+    # Attempt to download user-specified links (if model_links.txt provided)
     download_models_from_list()
 
-    # Ensure UVR models are present using original download_manager (keeps original project behavior)
+    # Ensure UVR models as original (will show progress)
     MDX_DOWNLOAD_LINK = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/"
     UVR_MODELS = [
         "UVR-MDX-NET-Voc_FT.onnx",
@@ -957,7 +809,6 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"download_manager: {id_model} -> {e}")
 
-    # Build and launch GUI (shows gradio links; share enabled on Colab if requested)
     app = get_gui(args.theme)
     app.queue(default_concurrency_limit=8)
     app.launch(max_threads=40, share=IS_COLAB, show_error=True, quiet=False, debug=IS_COLAB, ssr_mode=False)
