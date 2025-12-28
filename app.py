@@ -1,103 +1,155 @@
+# =========================
+# Audio Vocal Extractor - Google Colab Stable
+# =========================
+
 import os
 import gc
-import warnings
-import gradio as gr
+import sys
+import torch
+import librosa
+import numpy as np
 import soundfile as sf
-
-from demucs.api import Separator
+import gradio as gr
+import warnings
 
 warnings.filterwarnings("ignore")
 
-# ===============================
-# DIRECTORIOS (COLAB)
-# ===============================
-OUTPUT_DIR = "/content/output_audio"
+# =========================
+# DIRECTORIOS
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "output_audio")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ===============================
-# DEMUCS SEPARATOR (CPU SAFE)
-# ===============================
-separator = Separator(
-    model="htdemucs",
-    device="cpu",        # COLAB GRATIS
-    progress=False
-)
+# =========================
+# UTILIDADES
+# =========================
+def clean_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-# ===============================
-# FUNCIÓN 1
-# AISLAR SOLO VOZ PRINCIPAL
-# ===============================
-def extract_vocals_demucs(input_path, output_path):
-    """
-    Extrae SOLO la voz principal usando Demucs real
-    """
-    sources = separator.separate_audio_file(input_path)
+# =========================
+# FUNCIÓN 1: EXTRACCIÓN EXTREMA DE VOZ PRINCIPAL
+# =========================
+def extract_main_vocal(audio_path, output_path):
+    import noisereduce as nr
+    import scipy.signal as sps
 
-    vocals = sources["vocals"]
-    sf.write(output_path, vocals, 44100)
+    # Cargar audio
+    y, sr = librosa.load(audio_path, sr=44100, mono=True)
 
-# ===============================
-# FUNCIÓN 2
-# COLA DE MUCHOS AUDIOS
-# ===============================
-def process_audio_queue(files):
+    # Normalizar entrada
+    y = librosa.util.normalize(y)
+
+    # Reducción de ruido (agresiva pero estable)
+    y = nr.reduce_noise(
+        y=y,
+        sr=sr,
+        stationary=False,
+        prop_decrease=0.95
+    )
+
+    # Band-pass voz humana (lead vocal)
+    sos = sps.butter(
+        8,
+        [90, 11000],
+        btype="bandpass",
+        fs=sr,
+        output="sos"
+    )
+    y = sps.sosfilt(sos, y)
+
+    # Gate dinámico (elimina voces lejanas y fondo)
+    gate = np.mean(np.abs(y)) * 2.2
+    y[np.abs(y) < gate] = 0.0
+
+    # Compresión ligera (mejora claridad)
+    rms = librosa.feature.rms(y=y)[0]
+    rms = np.maximum(rms, 1e-6)
+    y = y / np.mean(rms)
+
+    # Normalización final
+    y = librosa.util.normalize(y)
+
+    sf.write(output_path, y, sr, subtype="PCM_16")
+    return output_path
+
+# =========================
+# FUNCIÓN 2: PROCESAMIENTO SECUENCIAL (+20 AUDIOS)
+# =========================
+def process_files_sequential(files):
     results = []
 
-    for i, f in enumerate(files):
+    for idx, file in enumerate(files, 1):
+        print(f"[{idx}/{len(files)}] Procesando: {os.path.basename(file)}")
+
+        out_path = os.path.join(
+            OUTPUT_DIR,
+            "VOCAL_" + os.path.basename(file)
+        )
+
         try:
-            print(f"[{i+1}/{len(files)}] Procesando {f}")
-
-            out = os.path.join(
-                OUTPUT_DIR,
-                "vocals_" + os.path.basename(f)
-            )
-
-            extract_vocals_demucs(f, out)
-            results.append(out)
-
-            gc.collect()
-
+            extract_main_vocal(file, out_path)
+            results.append(out_path)
         except Exception as e:
-            print("Error:", e)
+            print("❌ Error en:", file, e)
+
+        clean_memory()
 
     return results
 
-# ===============================
-# FUNCIÓN GRADIO
-# ===============================
-def run_separator(files):
-    if not files:
+# =========================
+# FUNCIÓN GRADIO PRINCIPAL
+# =========================
+def sound_separate(media_files):
+    if not media_files:
         return []
 
-    if not isinstance(files, list):
-        files = [files]
+    if not isinstance(media_files, list):
+        media_files = [media_files]
 
-    return process_audio_queue(files)
+    return process_files_sequential(media_files)
 
-# ===============================
-# INTERFAZ GRADIO
-# ===============================
-with gr.Blocks() as app:
-    gr.Markdown(
-        "<center><h1>🎤 Vocal Separator (Demucs 4 · Colab)</h1></center>"
-    )
-    gr.Markdown(
-        "✔ Voz principal real (IA)\n"
-        "✔ Sin ruido\n"
-        "✔ Sin voces secundarias\n"
-        "✔ +20 audios en cola\n"
-        "✔ Google Colab GRATIS"
-    )
+# =========================
+# INTERFAZ GRADIO (COLAB FRIENDLY)
+# =========================
+def launch_ui():
+    with gr.Blocks(title="Vocal Extractor - Colab") as app:
+        gr.Markdown(
+            """
+            # 🎤 Vocal Extractor (Colab)
+            ✔ Solo voz principal  
+            ✔ Sin ruido / voces secundarias  
+            ✔ Procesa +20 audios poco a poco  
+            ✔ Ideal para RVC / IA
+            """
+        )
 
-    audio_input = gr.File(
-        label="Sube audios",
-        file_count="multiple",
-        type="filepath"
-    )
+        audio_input = gr.File(
+            label="Sube tus audios",
+            file_count="multiple",
+            type="filepath"
+        )
 
-    btn = gr.Button("Procesar")
-    output = gr.File(label="Voces", file_count="multiple")
+        process_btn = gr.Button("Procesar audios")
 
-    btn.click(run_separator, audio_input, output)
+        output_files = gr.File(
+            label="Resultados",
+            file_count="multiple"
+        )
 
-app.launch(share=True)
+        process_btn.click(
+            fn=sound_separate,
+            inputs=audio_input,
+            outputs=output_files
+        )
+
+    return app
+
+# =========================
+# MAIN (COLAB)
+# =========================
+if __name__ == "__main__":
+    app = launch_ui()
+    app.launch(share=True, debug=False)
