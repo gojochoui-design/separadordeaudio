@@ -1,74 +1,59 @@
-# IMPORTAMOS LIBRERÍAS NECESARIAS
 import os
-import sys
 import gc
-import argparse
 import warnings
-import torch
-import librosa
-import numpy as np
-import soundfile as sf
 import gradio as gr
-from pedalboard import (
-    Pedalboard,
-    Compressor,
-    Gain,
-    HighpassFilter,
-    LowpassFilter
-)
+import soundfile as sf
 
-# IMPORTAMOS DEMUCS (SEPARADOR DE VOCES DE ALTA CALIDAD)
-from demucs import Demucs
+from demucs.api import Separator
 
-# ===============================
-# CONFIGURACIÓN GENERAL
-# ===============================
 warnings.filterwarnings("ignore")
 
-LOG_DIR = "/content/logs"
+# ===============================
+# DIRECTORIOS (COLAB)
+# ===============================
 OUTPUT_DIR = "/content/output_audio"
-
-os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ===============================
-# FUNCIÓN EXTRA 1: IA con Demucs
+# DEMUCS SEPARATOR (CPU SAFE)
 # ===============================
-def demucs_separate(input_path, output_path):
-    """
-    Usar Demucs para separar las voces (mejor calidad).
-    """
-    model = Demucs()  # Cargar el modelo Demucs
-
-    # Procesar el audio para separar las voces
-    wav, sr = librosa.load(input_path, sr=None, mono=False)
-    sources = model.separate(wav)
-
-    # Guardar solo la voz principal
-    vocals = sources['vocals']
-    sf.write(output_path, vocals.T, sr)  # Transponer para guardar en formato adecuado
+separator = Separator(
+    model="htdemucs",
+    device="cpu",        # COLAB GRATIS
+    progress=False
+)
 
 # ===============================
-# FUNCIÓN EXTRA 2
-# PROCESAMIENTO EN COLA (20+ AUDIOS)
+# FUNCIÓN 1
+# AISLAR SOLO VOZ PRINCIPAL
 # ===============================
-def process_audio_queue(file_list):
+def extract_vocals_demucs(input_path, output_path):
     """
-    Procesa muchos audios uno por uno usando Demucs.
+    Extrae SOLO la voz principal usando Demucs real
     """
+    sources = separator.separate_audio_file(input_path)
+
+    vocals = sources["vocals"]
+    sf.write(output_path, vocals, 44100)
+
+# ===============================
+# FUNCIÓN 2
+# COLA DE MUCHOS AUDIOS
+# ===============================
+def process_audio_queue(files):
     results = []
 
-    for i, file_path in enumerate(file_list):
+    for i, f in enumerate(files):
         try:
-            print(f"[{i+1}/{len(file_list)}] Procesando:", file_path)
+            print(f"[{i+1}/{len(files)}] Procesando {f}")
 
-            output_path = os.path.join(
+            out = os.path.join(
                 OUTPUT_DIR,
-                f"clean_vocal_{os.path.basename(file_path)}"
+                "vocals_" + os.path.basename(f)
             )
 
-            demucs_separate(file_path, output_path)
-            results.append(output_path)
+            extract_vocals_demucs(f, out)
+            results.append(out)
 
             gc.collect()
 
@@ -78,60 +63,41 @@ def process_audio_queue(file_list):
     return results
 
 # ===============================
-# GRADIO INPUT MULTIPLE
+# FUNCIÓN GRADIO
 # ===============================
-def audio_conf():
-    return gr.File(
-        label="Audios (múltiples)",
-        file_count="multiple",
-        type="filepath"
-    )
-
-# ===============================
-# FUNCIÓN PRINCIPAL GRADIO
-# ===============================
-def sound_separate(media_files):
-    if not media_files:
+def run_separator(files):
+    if not files:
         return []
 
-    if not isinstance(media_files, list):
-        media_files = [media_files]
+    if not isinstance(files, list):
+        files = [files]
 
-    return process_audio_queue(media_files)
+    return process_audio_queue(files)
 
 # ===============================
 # INTERFAZ GRADIO
 # ===============================
-def get_gui(theme="default"):
-    with gr.Blocks(theme=theme) as app:
-        gr.Markdown(
-            "<center><h1>🎤 Vocal Cleaner PRO con IA (Demucs)</h1></center>"
-        )
-        gr.Markdown(
-            "✔ Elimina ruido<br>"
-            "✔ Quita voces secundarias<br>"
-            "✔ Deja SOLO la voz principal (Demucs)<br>"
-            "✔ Soporta +20 audios"
-        )
+with gr.Blocks() as app:
+    gr.Markdown(
+        "<center><h1>🎤 Vocal Separator (Demucs 4 · Colab)</h1></center>"
+    )
+    gr.Markdown(
+        "✔ Voz principal real (IA)\n"
+        "✔ Sin ruido\n"
+        "✔ Sin voces secundarias\n"
+        "✔ +20 audios en cola\n"
+        "✔ Google Colab GRATIS"
+    )
 
-        audio_input = audio_conf()
-        process_btn = gr.Button("Procesar audios")
-        output_files = gr.File(
-            label="Resultados",
-            file_count="multiple"
-        )
+    audio_input = gr.File(
+        label="Sube audios",
+        file_count="multiple",
+        type="filepath"
+    )
 
-        process_btn.click(
-            sound_separate,
-            inputs=audio_input,
-            outputs=output_files
-        )
+    btn = gr.Button("Procesar")
+    output = gr.File(label="Voces", file_count="multiple")
 
-    return app
+    btn.click(run_separator, audio_input, output)
 
-# ===============================
-# MAIN
-# ===============================
-if __name__ == "__main__":
-    app = get_gui(args.theme)
-    app.launch(share=True)  # share=True en Colab para que sea accesible
+app.launch(share=True)
