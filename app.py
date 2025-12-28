@@ -727,36 +727,31 @@ def process_uvr_task(
     )
 
 
-def add_vocal_effects(input_file, output_file, reverb_room_size=0.6, vocal_reverb_dryness=0.8, reverb_damping=0.6, reverb_wet_level=0.35,
-                      delay_seconds=0.4, delay_mix=0.25,
-                      compressor_threshold_db=-25, compressor_ratio=3.5, compressor_attack_ms=10, compressor_release_ms=60,
-                      gain_db=3):
+def add_instrumental_effects(input_file, output_file,
+                             highpass_freq=120, lowpass_freq=11000,
+                             compressor_threshold_db=-15, compressor_ratio=1.4,
+                             compressor_attack_ms=15, compressor_release_ms=80,
+                             gain_db=0):
 
-    effects = [HighpassFilter()]
-
-    effects.append(Reverb(room_size=reverb_room_size, damping=reverb_damping, wet_level=reverb_wet_level, dry_level=vocal_reverb_dryness))
-
-    effects.append(Compressor(threshold_db=compressor_threshold_db, ratio=compressor_ratio,
-                              attack_ms=compressor_attack_ms, release_ms=compressor_release_ms))
-
-    if delay_seconds > 0 or delay_mix > 0:
-        effects.append(Delay(delay_seconds=delay_seconds, mix=delay_mix))
-        # print("delay applied")
-    # effects.append(Chorus())
-
-    if gain_db:
-        effects.append(Gain(gain_db=gain_db))
-        # print("added gain db")
+    effects = [
+        HighpassFilter(cutoff_frequency_hz=highpass_freq),
+        LowpassFilter(cutoff_frequency_hz=lowpass_freq),
+        Compressor(threshold_db=compressor_threshold_db,
+                   ratio=compressor_ratio,
+                   attack_ms=compressor_attack_ms,
+                   release_ms=compressor_release_ms)
+    ]
 
     board = Pedalboard(effects)
 
     with AudioFile(input_file) as f:
         with AudioFile(output_file, 'w', f.samplerate, f.num_channels) as o:
-            # Read one second of audio at a time, until the file is empty:
             while f.tell() < f.frames:
                 chunk = f.read(int(f.samplerate))
                 effected = board(chunk, f.samplerate, reset=False)
                 o.write(effected)
+
+
 
 
 def add_instrumental_effects(input_file, output_file, highpass_freq=100, lowpass_freq=12000,
@@ -859,6 +854,7 @@ def sound_separate(
     background_gain_db=3,
     target_format="WAV",
 ):
+    dereverb = True
     if not media_file:
         raise ValueError("The audio path is missing.")
 
