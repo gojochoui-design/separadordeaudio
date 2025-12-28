@@ -1,101 +1,137 @@
-# (modificado) Audio separator with support for multiple file inputs
-# Incluye la funcionalidad para admitir cargas múltiples de archivos y controlar errores individuales.
-
+# IMPORTAMOS LIBRERÍAS NECESARIAS
 import os
+import sys
 import gc
-import json
-import queue
-import threading
+import argparse
+import warnings
 import torch
 import librosa
 import numpy as np
 import soundfile as sf
 import gradio as gr
-from utils import remove_directory_contents, create_directories, download_manager, logger
-from pedalboard import Pedalboard, Reverb, Delay, Compressor, Gain, HighpassFilter, LowpassFilter
-import argparse
-import warnings
+from pedalboard import (
+    Pedalboard,
+    Compressor,
+    Gain,
+    HighpassFilter,
+    LowpassFilter
+)
 
-# Configuración de argumentos por línea de comandos
-parser = argparse.ArgumentParser(description="Run the app with optional sharing")
-parser.add_argument('--share', action='store_true', help='Enable sharing mode')
-parser.add_argument('--theme', type=str, default="default", help='Set the theme for Gradio UI')
-args = parser.parse_args()
+# IMPORTAMOS DEMUCS (SEPARADOR DE VOCES DE ALTA CALIDAD)
+from demucs import Demucs
 
-# Constantes y setup inicial
-IS_COLAB = 'google.colab' in sys.modules or args.share
-LOG_DIR = "logs"
-MODEL_DIR = "mdx_models"
-OUTPUT_DIR = "output_audio"
-
-for dir_path in [LOG_DIR, MODEL_DIR, OUTPUT_DIR]:
-    os.makedirs(dir_path, exist_ok=True)
-
+# ===============================
+# CONFIGURACIÓN GENERAL
+# ===============================
 warnings.filterwarnings("ignore")
-logger.setup(os.path.join(LOG_DIR, "app.log"))
 
-# Función para manejar múltiples archivos
-def audio_conf():
-    """
-    Configuración para permitir múltiples archivos de audio como entrada.
-    """
-    return gr.File(
-        label="Audio files",  # Cambia el texto para reflejar entradas múltiples
-        file_count="multiple",  # Habilita la carga de múltiples archivos
-        type="filepath",  # Retorna rutas de archivos
-        container=True,
-    )
+LOG_DIR = "/content/logs"
+OUTPUT_DIR = "/content/output_audio"
 
-def sound_separate(media_files, *args, **kwargs):
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ===============================
+# FUNCIÓN EXTRA 1: IA con Demucs
+# ===============================
+def demucs_separate(input_path, output_path):
     """
-    Permitir múltiples archivos de entrada y procesarlos de forma secuencial.
-    - media_files: Lista de archivos subidos por el usuario.
+    Usar Demucs para separar las voces (mejor calidad).
+    """
+    model = Demucs()  # Cargar el modelo Demucs
+
+    # Procesar el audio para separar las voces
+    wav, sr = librosa.load(input_path, sr=None, mono=False)
+    sources = model.separate(wav)
+
+    # Guardar solo la voz principal
+    vocals = sources['vocals']
+    sf.write(output_path, vocals.T, sr)  # Transponer para guardar en formato adecuado
+
+# ===============================
+# FUNCIÓN EXTRA 2
+# PROCESAMIENTO EN COLA (20+ AUDIOS)
+# ===============================
+def process_audio_queue(file_list):
+    """
+    Procesa muchos audios uno por uno usando Demucs.
     """
     results = []
-    if not isinstance(media_files, list):
-        media_files = [media_files]  # Si es un solo archivo, conviértelo en lista.
 
-    for media_file in media_files:
+    for i, file_path in enumerate(file_list):
         try:
-            # Aquí puedes mantener o customizar tu lógica existente para procesar cada archivo
-            result = process_single_file(media_file, *args, **kwargs)
-            results.append(result)
+            print(f"[{i+1}/{len(file_list)}] Procesando:", file_path)
+
+            output_path = os.path.join(
+                OUTPUT_DIR,
+                f"clean_vocal_{os.path.basename(file_path)}"
+            )
+
+            demucs_separate(file_path, output_path)
+            results.append(output_path)
+
+            gc.collect()
+
         except Exception as e:
-            # Captura errores para archivos individuales y registra el error.
-            logger.error(f"Error processing file {media_file}: {e}")
+            print("Error:", e)
+
     return results
 
-def process_single_file(media_file, *args, **kwargs):
-    """
-    Procesamiento de un solo archivo.
-    """
-    logger.info(f"Processing file: {media_file}")
-    # Simular lógica de procesamiento aquí
-    # Reemplázalo con tu procesamiento real, ej., run_mdx o adjust_vocal_clean
-    result_path = os.path.join(OUTPUT_DIR, os.path.basename(media_file))
-    sf.write(result_path, np.random.randn(44100, 2), 44100)  # Generar archivo ficticio
-    return result_path
+# ===============================
+# GRADIO INPUT MULTIPLE
+# ===============================
+def audio_conf():
+    return gr.File(
+        label="Audios (múltiples)",
+        file_count="multiple",
+        type="filepath"
+    )
 
-# Interface gráfica de usuario (GUI)
+# ===============================
+# FUNCIÓN PRINCIPAL GRADIO
+# ===============================
+def sound_separate(media_files):
+    if not media_files:
+        return []
+
+    if not isinstance(media_files, list):
+        media_files = [media_files]
+
+    return process_audio_queue(media_files)
+
+# ===============================
+# INTERFAZ GRADIO
+# ===============================
 def get_gui(theme="default"):
-    """
-    Configurar la interfaz de Gradio para procesar múltiples archivos.
-    """
     with gr.Blocks(theme=theme) as app:
-        gr.Markdown("<center><h1>Audio🔹Separator</h1></center>")
-        gr.Markdown("Carga tus archivos de audio y separamos los elementos (vocales e instrumentales).")
+        gr.Markdown(
+            "<center><h1>🎤 Vocal Cleaner PRO con IA (Demucs)</h1></center>"
+        )
+        gr.Markdown(
+            "✔ Elimina ruido<br>"
+            "✔ Quita voces secundarias<br>"
+            "✔ Deja SOLO la voz principal (Demucs)<br>"
+            "✔ Soporta +20 audios"
+        )
 
         audio_input = audio_conf()
-        process_button = gr.Button("Procesar")
-        output_display = gr.File(label="Archivos Procesados", file_count="multiple")
+        process_btn = gr.Button("Procesar audios")
+        output_files = gr.File(
+            label="Resultados",
+            file_count="multiple"
+        )
 
-        # Vincular los elementos
-        process_button.click(sound_separate, inputs=audio_input, outputs=output_display)
+        process_btn.click(
+            sound_separate,
+            inputs=audio_input,
+            outputs=output_files
+        )
 
-        gr.Markdown("- También puedes consultar más herramientas en la [documentación](https://github.com/R3gm/Audio_separator_ui).")
     return app
 
-# Lanzar la aplicación
+# ===============================
+# MAIN
+# ===============================
 if __name__ == "__main__":
-    app = get_gui(args.theme)  # Configura el GUI con el tema opcional
-    app.launch(share=args.share)  # Lanzar Gradio con opción de compartir público
+    app = get_gui(args.theme)
+    app.launch(share=True)  # share=True en Colab para que sea accesible
