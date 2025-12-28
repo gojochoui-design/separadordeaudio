@@ -1,126 +1,101 @@
-# --- Corrected Audio Separator App --- #
-# This version resolves the 'sys is not defined' NameError and ensures all required libraries are properly imported.
+# (modificado) Audio separator with support for multiple file inputs
+# Incluye la funcionalidad para admitir cargas múltiples de archivos y controlar errores individuales.
 
-# Import required modules
 import os
-import sys  # Ensure necessary imports like sys are included
 import gc
+import json
 import queue
 import threading
-import logging
-import argparse
-import json
 import torch
-import numpy as np
 import librosa
+import numpy as np
 import soundfile as sf
 import gradio as gr
-import time
 from utils import remove_directory_contents, create_directories, download_manager, logger
 from pedalboard import Pedalboard, Reverb, Delay, Compressor, Gain, HighpassFilter, LowpassFilter
-from pedalboard.io import AudioFile
+import argparse
 import warnings
 
-# Setup argparse for command-line arguments
+# Configuración de argumentos por línea de comandos
 parser = argparse.ArgumentParser(description="Run the app with optional sharing")
-parser.add_argument('--share', action='store_true', help='Enable sharing mode, e.g., in Colab')
-parser.add_argument('--theme', type=str, default="default", help='UI theme for Gradio app')
+parser.add_argument('--share', action='store_true', help='Enable sharing mode')
+parser.add_argument('--theme', type=str, default="default", help='Set the theme for Gradio UI')
 args = parser.parse_args()
 
-# Set up constant values for environment checks
+# Constantes y setup inicial
 IS_COLAB = 'google.colab' in sys.modules or args.share
-IS_ZERO_GPU = os.getenv("SPACES_ZERO_GPU")
-
-# Create necessary directories
 LOG_DIR = "logs"
 MODEL_DIR = "mdx_models"
 OUTPUT_DIR = "output_audio"
+
 for dir_path in [LOG_DIR, MODEL_DIR, OUTPUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
-# Initialize logging
-logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "app.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-# Constants for the app
-DEMO_TITLE = "<center><strong><font size='7'>Audio🔹Separator</font></strong></center>"
-DEMO_DESCRIPTION = "Separate vocals and instruments from audio tracks using AI models."
-RESOURCES = "- Learn more at [Audio🔹Separator Guide](https://github.com/R3gm/Audio_separator_ui)."
-
-# Suppress warnings
 warnings.filterwarnings("ignore")
+logger.setup(os.path.join(LOG_DIR, "app.log"))
 
-# Function to download models asynchronously
-def download_uvr_models():
-    """Download MDX/UVR models in the background."""
-    try:
-        logging.info("Background model download started.")
-        UVR_MODELS = [
-            "UVR-MDX-NET-Voc_FT.onnx",
-            "UVR_MDXNET_KARA_2.onnx",
-            "Reverb_HQ_By_FoxJoy.onnx",
-            "UVR-MDX-NET-Inst_HQ_4.onnx",
-        ]
-        base_url = "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/"
-        for model in UVR_MODELS:
-            model_url = base_url + model
-            logging.info(f"Downloading: {model}")
-            try:
-                download_manager(model_url, MODEL_DIR)
-                logging.info(f"Successfully downloaded: {model}")
-            except Exception as e:
-                logging.warning(f"Failed to download {model}: {e}")
-    except Exception as e:
-        logging.exception(f"Could not complete model downloads: {e}")
-
-# Replace this function with your actual audio processing logic
-def process_audio_files(file_paths):
+# Función para manejar múltiples archivos
+def audio_conf():
     """
-    Placeholder for audio processing. Replace this with your implementation.
-    Accepts multiple audio paths, processes them, and returns results.
+    Configuración para permitir múltiples archivos de audio como entrada.
+    """
+    return gr.File(
+        label="Audio files",  # Cambia el texto para reflejar entradas múltiples
+        file_count="multiple",  # Habilita la carga de múltiples archivos
+        type="filepath",  # Retorna rutas de archivos
+        container=True,
+    )
+
+def sound_separate(media_files, *args, **kwargs):
+    """
+    Permitir múltiples archivos de entrada y procesarlos de forma secuencial.
+    - media_files: Lista de archivos subidos por el usuario.
     """
     results = []
-    for file_path in file_paths:
+    if not isinstance(media_files, list):
+        media_files = [media_files]  # Si es un solo archivo, conviértelo en lista.
+
+    for media_file in media_files:
         try:
-            # Simulate processing time
-            time.sleep(0.5)
-            processed_file = f"{file_path} (processed)"
-            results.append(processed_file)
+            # Aquí puedes mantener o customizar tu lógica existente para procesar cada archivo
+            result = process_single_file(media_file, *args, **kwargs)
+            results.append(result)
         except Exception as e:
-            logging.error(f"Failed to process file {file_path}: {e}")
+            # Captura errores para archivos individuales y registra el error.
+            logger.error(f"Error processing file {media_file}: {e}")
     return results
 
-# Gradio app setup
+def process_single_file(media_file, *args, **kwargs):
+    """
+    Procesamiento de un solo archivo.
+    """
+    logger.info(f"Processing file: {media_file}")
+    # Simular lógica de procesamiento aquí
+    # Reemplázalo con tu procesamiento real, ej., run_mdx o adjust_vocal_clean
+    result_path = os.path.join(OUTPUT_DIR, os.path.basename(media_file))
+    sf.write(result_path, np.random.randn(44100, 2), 44100)  # Generar archivo ficticio
+    return result_path
+
+# Interface gráfica de usuario (GUI)
 def get_gui(theme="default"):
-    """Set up the Gradio interface for the app."""
-    with gr.Blocks(theme=theme, analytics_enabled=False) as app:
-        gr.Markdown(DEMO_TITLE)
-        gr.Markdown(DEMO_DESCRIPTION)
+    """
+    Configurar la interfaz de Gradio para procesar múltiples archivos.
+    """
+    with gr.Blocks(theme=theme) as app:
+        gr.Markdown("<center><h1>Audio🔹Separator</h1></center>")
+        gr.Markdown("Carga tus archivos de audio y separamos los elementos (vocales e instrumentales).")
 
-        # File upload and processing
-        file_upload = gr.File(label="Upload Audio Files", file_count="multiple", file_types=[".wav", ".mp3"])
-        process_btn = gr.Button("Process Files")
-        output_display = gr.Textbox(label="Processed Outputs")
+        audio_input = audio_conf()
+        process_button = gr.Button("Procesar")
+        output_display = gr.File(label="Archivos Procesados", file_count="multiple")
 
-        # Bind button click to file processing
-        process_btn.click(process_audio_files, inputs=file_upload, outputs=output_display)
+        # Vincular los elementos
+        process_button.click(sound_separate, inputs=audio_input, outputs=output_display)
 
-        # Link to resources
-        gr.Markdown(RESOURCES)
-
+        gr.Markdown("- También puedes consultar más herramientas en la [documentación](https://github.com/R3gm/Audio_separator_ui).")
     return app
 
-# Main block
+# Lanzar la aplicación
 if __name__ == "__main__":
-    # Download models in the background
-    threading.Thread(target=download_uvr_models, daemon=True).start()
-
-    # Launch Gradio app
-    try:
-        app = get_gui(args.theme)
-        app.launch(share=args.share, show_error=True)
-    except Exception as e:
-        logging.exception(f"Failed to launch Gradio app: {e}")
+    app = get_gui(args.theme)  # Configura el GUI con el tema opcional
+    app.launch(share=args.share)  # Lanzar Gradio con opción de compartir público
